@@ -29,18 +29,19 @@ Designed as a modern, high-speed alternative to traditional log monitors like Fa
 
 ## Architecture Overview
 
+```text
 +---------------+     +-------------------------+     +-----------------------+
-|  Log Files    | --> | Real-Time Log Tailer    | --> | C99 Token Evaluator   |
+|   Log Files   | --> |  Real-Time Log Tailer   | --> |  C99 Token Evaluator  |
 +---------------+     +-------------------------+     +-----------------------+
                                                                   |
-                                              +-------------------+-------------------+
-                                              |                                       |
-                                              v                                       v
-                                +---------------------------+           +--------------------------+
-                                | Memory & TTL Tracking     |           | Kernel Enforcement       |
-                                | (/var/lib/uban/*.db)      |           | (nftables uban_filter)   |
-                                +---------------------------+           +--------------------------+
-
+                      +-------------------------------------------+
+                      |                           |
+                      v                           v
+        +---------------------------+   +--------------------------+
+        |   Memory & TTL Tracking   |   |   Kernel Enforcement     |
+        |   (/var/lib/uban/*.db)    |   |  (nftables uban_filter)  |
+        +---------------------------+   +--------------------------+
+```
 Unlike Python-based log monitors that parse complex regular expressions across whole lines, `uban` uses space-delimited and delimiter-aware token extraction (`""`, `()`, `[]`, `{}`, `<>`) combined with fast C string operations to inspect log lines in microseconds upon disk write.
 
 ---
