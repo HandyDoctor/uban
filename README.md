@@ -205,7 +205,7 @@ If your server or web application is secured by `uban`, you can optionally displ
 You can embed the badge on your website using the following HTML snippet:
 
     <a href="https://github.com/HandyDoctor/uban" target="_blank" rel="noopener noreferrer">
-      <img src="https://raw.githubusercontent.com/HandyDoctor/uban/main/assets/uban_protected.jpg" alt="Protected by UBAN Security Daemon" width="120" height="120" />
+      <img src="https://github.com/HandyDoctor/uban/blob/main/assets/uban_protected.jpg" alt="Protected by UBAN Security Daemon" width="120" height="120" />
     </a>
 
 ---
