@@ -1,0 +1,16 @@
+# Compiled binaries
+uban
+
+# Object files and build output
+obj/
+*.o
+
+# Temporary or state files generated during local testing
+bans.state
+*.db
+*.log
+
+# Editor / System temporary files
+.DS_Store
+*.swp
+*~

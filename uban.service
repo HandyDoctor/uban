@@ -1,0 +1,30 @@
+[Unit]
+Description=Universal Ban (uban) Security Engine
+After=network.target nftables.service ufw.service
+Wants=nftables.service ufw.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+SupplementaryGroups=adm www-data
+ExecStart=/usr/local/bin/uban
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+
+# State & Logging Directories (auto-created by systemd if missing)
+StateDirectory=uban
+LogsDirectory=uban
+
+# File Access
+ReadWritePaths=/var/lib/uban /var/log
+
+# Sandboxing & Security Hardening
+ProtectSystem=full
+ProtectHome=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,202 @@
+NAME
+    uban - Universal Ban Daemon for Linux
+
+SYNOPSIS
+    uban <command> [options] [jail_name] [target_ip(s)]
+
+DESCRIPTION
+    uban is an open-source, high-performance, lightweight security daemon
+    designed to inspect log files in real time and automatically enforce
+    kernel-level IP bans using nftables (table: inet uban_filter).
+
+    UNIVERSAL & APP-AGNOSTIC
+    Unlike conventional log monitors, uban is completely application-agnostic.
+    While it works out of the box with common software such as Nginx, Apache,
+    SSHD, and PostgreSQL, uban can monitor ANY service. It only requires a log
+    file containing IP addresses and actionable keywords defined by the system
+    administrator in the jail configuration.
+
+COMMANDS
+    status [options] [jail_name]
+        Display currently active kernel bans, remaining expiration timers, and
+        jail statistics directly from nftables.
+
+        Options:
+            -d
+                Display detailed table output including remaining ban expiration
+                timers for each banned IP address. Without -d, uban displays
+                a compact list of IP addresses only.
+
+            -t
+                Sort output by remaining ban expiration time (descending).
+
+            -a <app_name>
+                Display active bans across all jails associated with a specific
+                application (e.g., uban status -a nginx).
+
+            [jail_name] or -j <jail_name>
+                Display bans for a single target jail (e.g., uban status nginx_444).
+                The '-j' prefix is optional.
+
+        Note: IP sorting (numerical) is applied by default. Options -d and -t
+        can be combined (e.g., uban status -d -t).
+
+    ban <jail_name> <ip_address> [duration]
+        Manually ban a single target IP address under a specified jail.
+
+        Arguments:
+            <jail_name>
+                Target jail rule set to enforce the ban under.
+
+            <ip_address>
+                The target IPv4 address to ban (single IP per command).
+
+            [duration]
+                Ban duration timeout. If omitted, uses default bantime from
+                jail configuration. Supports raw seconds or time-unit suffixes:
+                  - 3600 (3600 seconds)
+                  - 30m  (30 minutes)
+                  - 24h  (24 hours)
+                  - 7d   (7 days)
+                  - 5y   (5 years)
+                  - 0    (Permanent ban / infinite lifetime)
+
+    unban <ip_address> [ip_address2 ...]
+        Manually remove active kernel bans for one or more space-separated IP
+        addresses across all uban firewall sets.
+
+    flush [options] [jail_name]
+        Unban IP addresses and clear active kernel firewall sets managed by uban.
+
+        Options:
+            (no options)
+                If omitted (and -a or jail_name is not specified), active kernel
+                bans across all uban-managed jails are flushed. Historical
+                offender counts (.db) are preserved.
+
+            -a <app_name>
+                Flush active bans across all uban jails associated with a specific
+                application (e.g., uban flush -a nginx).
+
+            [jail_name]
+                Flush active bans for a specific jail only (e.g., uban flush nginx_444).
+
+            --reset
+                PERMANENT STATE RESET.
+                Wipes persistent database files (.db) on SSD and resets
+                historical offender escalation counts back to zero.
+
+                --reset can be appended to any flush command variant:
+                  - uban flush --reset
+                  - uban flush -a <app_name> --reset
+                  - uban flush <jail_name> --reset
+
+                WARNING:
+                This flag CANNOT be shortened to '-r'. Standard flush clears
+                active uban kernel bans while keeping historical offender counts
+                intact so future repeat attacks continue to receive escalated
+                ban times. Using --reset permanently wipes historical tracking.
+
+    start
+        Start the uban background daemon service process.
+
+    stop
+        Stop the running uban background daemon service process.
+
+    reload
+        ZERO-DOWNTIME HOT CONFIG & LOG HANDLE RELOAD (SIGHUP).
+        Sends SIGHUP to the running daemon process. The process remains active
+        and running continuously. It re-reads uban.conf to apply new rules,
+        re-opens log file handles (for logrotate support), and syncs active
+        state without wiping in-memory timers.
+
+        Key characteristic:
+        Active kernel firewall bans are completely untouched and maintained
+        without dropping protection for even a millisecond. Recommended for
+        log rotation and on-the-fly config updates.
+
+    restart
+        FULL PROCESS REBOOT CYCLE (SIGTERM + START).
+        Gracefully terminates the active uban daemon process (SIGTERM) and starts
+        a fresh daemon instance.
+
+        Key characteristic:
+        Saves current active bans to disk state (bans.state), shuts down log
+        monitors, releases file handles, re-initializes nftables structures,
+        and reloads remaining TTL state from disk upon boot. Use when upgrading
+        the binary executable.
+
+    version, -v, --version
+        Display uban daemon version and compile info.
+
+    help, -h, --help
+        Display this help documentation.
+
+FILES
+    /etc/uban/uban.conf
+        Primary system configuration file containing daemon settings, poll
+        intervals, and jail rule definitions.
+
+    /etc/uban/uban.help
+        System help text file displayed by 'uban help'.
+
+    /var/lib/uban/*.db
+        Persistent disk files tracking historical offender ban escalation
+        counts per jail across reboots.
+
+    /var/lib/uban/bans.state
+        Snapshot state file storing active kernel ban TTLs across service restarts.
+
+    /var/log/uban/*.log
+        Daemon execution and unban expiration logs.
+
+EXAMPLES
+    uban status
+        Display all active uban bans in compact view, sorted by IP address.
+
+    uban status -d
+        Display detailed active uban bans table with remaining expiration timers.
+
+    uban status -d -t
+        Display detailed active uban bans table sorted by remaining expiration
+        time (descending).
+
+    uban status nginx_444
+        Display active bans specifically for the nginx_444 jail.
+
+    uban status -a nginx
+        Display active bans for all jails grouped under the 'nginx' app.
+
+    uban ban nginx_444 1.2.3.4 24h
+        Manually ban IP 1.2.3.4 in the nginx_444 jail for 24 hours.
+
+    uban ban sshd 5.6.7.8 0
+        Manually ban IP 5.6.7.8 permanently under the sshd jail.
+
+    uban unban 1.2.3.4 5.6.7.8 9.10.11.12
+        Unban three IP addresses simultaneously across all uban firewall sets.
+
+    uban flush
+        Unban all currently blocked IPs in uban nftables sets while preserving
+        persistent offender history (.db) on disk.
+
+    uban flush -a nginx
+        Unban active IPs for all jails under the 'nginx' app while preserving .db history.
+
+    uban flush nginx_444
+        Unban active IPs for the nginx_444 jail only while preserving .db history.
+
+    uban flush --reset
+        Clear active kernel bans across all uban jails AND permanently delete all
+        historical .db offender records.
+
+    uban flush -a nginx --reset
+        Clear active kernel bans for all 'nginx' jails AND permanently delete
+        their associated .db offender records.
+
+    uban flush nginx_444 --reset
+        Clear active kernel bans for nginx_444 AND permanently delete its
+        associated .db offender record.
+
+SEE ALSO
+    nftables(8), nft(8), systemctl(1)

@@ -1,0 +1,15 @@
+/var/log/uban/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    maxsize 10M
+    su root adm
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        systemctl reload uban > /dev/null 2>&1 || true
+    endscript
+}
