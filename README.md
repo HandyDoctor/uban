@@ -201,7 +201,7 @@ Measured on Linux (Kernel 6.x) monitoring active web server logs under a 10,000 
 
 ## Displaying the UBAN Protected Badge
 
-If your server or web application is secured by `uban`, you can optionally display the **UBAN Protected** badge in your website footer or site documentation. This is completely optional.
+If your server or web application is secured by `uban`, you can optionally display the **UBAN Protected** badge (available under assets/) in your website footer or site documentation. This is completely optional.
 
 You can embed the badge on your website using the following HTML snippet:
 
