@@ -75,9 +75,14 @@ install: $(TARGET)
 	@echo "Installation complete."
 
 uninstall:
+	-systemctl stop $(TARGET) 2>/dev/null || true
+	-systemctl disable $(TARGET) 2>/dev/null || true
+	-nft delete table inet uban_filter 2>/dev/null || true
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(CONFDIR)/uban.help
 	rm -f $(DESTDIR)$(LOGROTDIR)/uban
 	rm -f $(DESTDIR)$(SYSTEMDDIR)/uban.service
+	-systemctl daemon-reload 2>/dev/null || true
 	@echo "Uninstalled uban binary, help text, logrotate, and service unit."
+	@echo "Active kernel firewall table (inet uban_filter) removed."
 	@echo "Note: Configuration ($(CONFDIR)) and data directories ($(VARDIR), $(LOGDIR)) were preserved."
