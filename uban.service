@@ -7,7 +7,6 @@ Wants=nftables.service ufw.service
 Type=simple
 User=root
 Group=root
-SupplementaryGroups=adm www-data
 ExecStart=/usr/local/bin/uban
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
