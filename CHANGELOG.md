@@ -72,6 +72,7 @@ sudo make install
 ```
 * `make install` updates the `uban` binary and `/etc/uban/uban.help` while preserving `/etc/uban/uban.conf`.
 * `scripts/db_migration.sh` requires the `sqlite3` CLI (`apt install sqlite3` / `dnf install sqlite`) to convert legacy v1.0 state files into `/var/lib/uban/uban.sqlite`. Alternatively, copy `/var/lib/uban/` to another host with `sqlite3`, run `scripts/db_migration.sh`, and copy `uban.sqlite` back.
+* Cleanup: Once migration is complete, sqlite3 is no longer needed (uban embeds SQLite directly into its binary). You can safely remove it with `apt remove sqlite3`.
 
 #### 5. Review Log Offset Positions (Recommended)
 Ensure `ip_pos` and `match_pos` use positive left-based offsets placed **before** user-controlled request strings or headers to prevent token displacement and line truncation.
