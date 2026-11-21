@@ -16,10 +16,30 @@ DESCRIPTION
     file containing IP addresses and actionable keywords defined by the system
     administrator in the jail configuration.
 
+    PERSISTENCE & RECOVERY
+    Active countdown bans, permanent bans, and historical escalation strike counts
+    are managed inside an ACID-compliant, WAL-mode SQLite database
+    (/var/lib/uban/uban.sqlite). At startup, uban creates an automated point-in-time
+    snapshot of kernel nftables sets (maintaining up to 5 rolling prestart dumps
+    in /var/lib/uban/ for state disaster recovery). In addition, administrators can
+    take on-demand manual snapshots that are permanently preserved until explicitly
+    deleted.
+
+    OPERATIONAL SERVICE REQUIREMENTS
+    Commands fall into three distinct execution contexts based on daemon state:
+      - REQUIRES RUNNING DAEMON:
+        ban, unban, flush, reload (IPC dispatched via /run/uban/uban.cmd; commands
+        are rejected if the service is offline).
+      - RUNS ONLINE OR OFFLINE:
+        status, save_to_snapshot (queries or dumps kernel tables directly).
+      - REQUIRES STOPPED DAEMON:
+        restore_from_snapshot (reconciles SQLite baseline; service must be halted
+        to eliminate lock contention and race conditions).
+
 COMMANDS
     status [options] [jail_name]
         Display currently active kernel bans, remaining expiration timers, and
-        jail statistics directly from nftables.
+        jail statistics directly from nftables. Safe to run online or offline.
 
         Options:
             -d
@@ -39,14 +59,21 @@ COMMANDS
                 The '-j' prefix is optional.
 
         Note: IP sorting (numerical) is applied by default. Options -d and -t
-        can be combined (e.g., uban status -d -t).
+        can be combined (e.g., uban status -d -t). Status output includes
+        both enabled and disabled jails.
 
     ban <jail_name> <ip_address> [duration]
         Manually ban a single target IP address under a specified jail.
 
+        REQUIREMENT:
+        The uban daemon MUST BE RUNNING. If the service is offline, the command
+        fails immediately and will not queue.
+
         Arguments:
             <jail_name>
-                Target jail rule set to enforce the ban under.
+                Target jail rule set to enforce the ban under. The jail must
+                exist in uban.conf. Manual bans are fully permitted into disabled
+                jails (traffic is actively dropped and logged with [DISABLED JAIL]).
 
             <ip_address>
                 The target IPv4 address to ban (single IP per command).
@@ -62,17 +89,26 @@ COMMANDS
                   - 0    (Permanent ban / infinite lifetime)
 
     unban <ip_address> [ip_address2 ...]
-        Manually remove active kernel bans for one or more space-separated IP
-        addresses across all uban firewall sets.
+        Manually remove active bans for one or more space-separated IP
+        addresses across all uban firewall sets (both enabled and disabled jails)
+        and mark them inactive in the SQLite database.
+
+        REQUIREMENT:
+        The uban daemon MUST BE RUNNING. If the service is offline, the command
+        fails immediately and will not queue.
 
     flush [options] [jail_name]
         Unban IP addresses and clear active kernel firewall sets managed by uban.
+
+        REQUIREMENT:
+        The uban daemon MUST BE RUNNING. If the service is offline, the command
+        fails immediately and will not queue.
 
         Options:
             (no options)
                 If omitted (and -a or jail_name is not specified), active kernel
                 bans across all uban-managed jails are flushed. Historical
-                offender counts (.db) are preserved.
+                offender counts in SQLite are preserved (marked ban_end = -1).
 
             -a <app_name>
                 Flush active bans across all uban jails associated with a specific
@@ -80,11 +116,13 @@ COMMANDS
 
             [jail_name]
                 Flush active bans for a specific jail only (e.g., uban flush nginx_444).
+                Works on both enabled and disabled jails.
 
             --reset
-                PERMANENT STATE RESET.
-                Wipes persistent database files (.db) on SSD and resets
-                historical offender escalation counts back to zero.
+                PERMANENT DATABASE RESET.
+                Truncates the persistent SQLite database (uban.sqlite), permanently
+                wiping all historical records and resetting escalation strike counts
+                back to zero.
 
                 --reset can be appended to any flush command variant:
                   - uban flush --reset
@@ -95,7 +133,52 @@ COMMANDS
                 This flag CANNOT be shortened to '-r'. Standard flush clears
                 active uban kernel bans while keeping historical offender counts
                 intact so future repeat attacks continue to receive escalated
-                ban times. Using --reset permanently wipes historical tracking.
+                ban times. Using --reset permanently wipes historical records within 
+				the chosen scope.
+
+    save_to_snapshot [destination_path]
+        Export the current live kernel nftables ruleset to a snapshot file.
+        This command is safe to run while the uban daemon is actively running
+        or stopped.
+
+        If [destination_path] is omitted, uban automatically generates a timestamped
+        snapshot in /var/lib/uban/ using the format:
+            nftables_manual_YYYYMMDD_HHMMSS.dump
+
+        Arguments:
+            [destination_path]
+                Optional file destination. Supports:
+                  - Bare filename: places the file in /var/lib/uban/ (e.g., backup.dump)
+                  - Absolute path: saves directly to target (e.g., /root/backup.dump)
+                  - Relative path: resolves from CWD (e.g., ./backup.dump)
+                  - Home directory shortcut: expands ~/ (e.g., ~/my_snapshot.dump)
+
+        NOTE:
+        Manual snapshots are NEVER automatically pruned by uban's retention
+        rotation. They remain on disk until manually removed by an administrator.
+
+    restore_from_snapshot [dump_file]
+        Reconcile and restore the SQLite database state from a kernel snapshot file.
+        If [dump_file] is omitted, uban selects and restores from the most recent
+        automated prestart snapshot found in /var/lib/uban/.
+
+        EXPIRATION & TIMEOUT CALCULATION BEHAVIOR:
+          - Timestamped snapshots (nftables_prestart_*.dump, nftables_manual_*.dump):
+            Ban durations are dynamically realigned. uban parses the timestamp embedded
+            in the filename, computes the elapsed age of the snapshot, and subtracts
+            that time from each entry's timeout. This accurately preserves the true
+            remaining ban time rather than resetting the clock. If a timeout has
+            already expired since the snapshot was taken, it is pruned immediately.
+          - Custom / Static snapshots (e.g., backup.dump, my_snapshot.dump):
+            Because no creation timestamp is embedded in the filename, timeouts
+            are treated as raw static durations and will be calculated fresh starting
+            from the current time.
+
+        CRITICAL REQUIREMENT:
+        The uban daemon MUST BE STOPPED ('uban stop' or 'systemctl stop uban')
+        before running restore_from_snapshot. Running restore while the daemon
+        is active will be rejected to prevent database lock contention and race
+        conditions with runtime expiration routines.
 
     start
         Start the uban background daemon service process.
@@ -108,23 +191,12 @@ COMMANDS
         Sends SIGHUP to the running daemon process. The process remains active
         and running continuously. It re-reads uban.conf to apply new rules,
         re-opens log file handles (for logrotate support), and syncs active
-        state without wiping in-memory timers.
-
-        Key characteristic:
-        Active kernel firewall bans are completely untouched and maintained
-        without dropping protection for even a millisecond. Recommended for
-        log rotation and on-the-fly config updates.
+        state without dropping protection. Requires the daemon to be running.
 
     restart
         FULL PROCESS REBOOT CYCLE (SIGTERM + START).
         Gracefully terminates the active uban daemon process (SIGTERM) and starts
         a fresh daemon instance.
-
-        Key characteristic:
-        Saves current active bans to disk state (bans.state), shuts down log
-        monitors, releases file handles, re-initializes nftables structures,
-        and reloads remaining TTL state from disk upon boot. Use when upgrading
-        the binary executable.
 
     version, -v, --version
         Display uban daemon version and compile info.
@@ -140,22 +212,27 @@ FILES
     /etc/uban/uban.help
         System help text file displayed by 'uban help'.
 
-    /var/lib/uban/*.db
-        Persistent disk files tracking historical offender ban escalation
-        counts per jail across reboots.
+    /run/uban/uban.cmd
+        Runtime IPC command pipe monitored by the daemon via inotify.
 
-    /var/lib/uban/bans.state
-        Snapshot state file storing active kernel ban TTLs across service restarts.
+    /var/lib/uban/uban.sqlite
+        ACID SQLite persistent database tracking active bans, expiration epochs,
+        and historical strike escalation counts across reboots.
+
+    /var/lib/uban/nftables_prestart_*.dump
+        Automated timestamped kernel snapshots captured at daemon startup.
+        A rolling circular buffer of up to 5 dumps is preserved automatically.
+
+    /var/lib/uban/nftables_manual_*.dump
+        Manual administrator snapshots generated via 'save_to_snapshot'.
+        Permanently retained; excluded from automatic pruning routines.
 
     /var/log/uban/*.log
-        Daemon execution and unban expiration logs.
+        Daemon execution, unban expiration, and security audit logs.
 
 EXAMPLES
     uban status
         Display all active uban bans in compact view, sorted by IP address.
-
-    uban status -d
-        Display detailed active uban bans table with remaining expiration timers.
 
     uban status -d -t
         Display detailed active uban bans table sorted by remaining expiration
@@ -164,39 +241,42 @@ EXAMPLES
     uban status nginx_444
         Display active bans specifically for the nginx_444 jail.
 
-    uban status -a nginx
-        Display active bans for all jails grouped under the 'nginx' app.
-
     uban ban nginx_444 1.2.3.4 24h
-        Manually ban IP 1.2.3.4 in the nginx_444 jail for 24 hours.
+        Manually ban IP 1.2.3.4 in the nginx_444 jail for 24 hours (daemon running).
 
     uban ban sshd 5.6.7.8 0
-        Manually ban IP 5.6.7.8 permanently under the sshd jail.
+        Manually ban IP 5.6.7.8 permanently under the sshd jail (daemon running).
 
     uban unban 1.2.3.4 5.6.7.8 9.10.11.12
         Unban three IP addresses simultaneously across all uban firewall sets.
 
     uban flush
         Unban all currently blocked IPs in uban nftables sets while preserving
-        persistent offender history (.db) on disk.
-
-    uban flush -a nginx
-        Unban active IPs for all jails under the 'nginx' app while preserving .db history.
-
-    uban flush nginx_444
-        Unban active IPs for the nginx_444 jail only while preserving .db history.
+        persistent offender history in SQLite.
 
     uban flush --reset
-        Clear active kernel bans across all uban jails AND permanently delete all
-        historical .db offender records.
+        Clear active kernel bans across all uban jails AND permanently reset
+        all SQLite persistent offender records.
 
-    uban flush -a nginx --reset
-        Clear active kernel bans for all 'nginx' jails AND permanently delete
-        their associated .db offender records.
+    uban save_to_snapshot
+        Capture current firewall state to a timestamped manual dump in
+        /var/lib/uban/nftables_manual_YYYYMMDD_HHMMSS.dump.
 
-    uban flush nginx_444 --reset
-        Clear active kernel bans for nginx_444 AND permanently delete its
-        associated .db offender record.
+    uban save_to_snapshot custom_backup.dump
+        Save a manual dump named 'custom_backup.dump' inside /var/lib/uban/.
+
+    uban save_to_snapshot ~/firewall_backup.dump
+        Save a manual dump directly to the user's home directory.
+
+    uban restore_from_snapshot
+        Restore SQLite state from the latest prestart dump, automatically
+        realigning remaining ban expirations (daemon must be stopped).
+
+    uban restore_from_snapshot /var/lib/uban/nftables_manual_20261110_101700.dump
+        Restore SQLite state from a timestamped manual snapshot with age realignments.
+
+    uban restore_from_snapshot custom_backup.dump
+        Restore SQLite state using raw static timeouts calculated from the current time.
 
 SEE ALSO
     nftables(8), nft(8), systemctl(1)

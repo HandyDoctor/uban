@@ -2,13 +2,15 @@
  * uban ("Universal Ban") - High-Performance C99 Security Daemon
  *
  * File:        firewall.c
- * Description: Kernel-level nftables netlink/CLI wrapper for IP ban and unban enforcement.
+ * Description: Kernel-level nftables netlink/CLI wrapper, snapshot dumper, and sync engine.
  *
  * Copyright (c) 2026 UBAN Security Engine Project
  * Licensed under the MIT License. See LICENSE in the project root.
  */
 
 #include "uban.h"
+#include <dirent.h>
+#include <stdbool.h>
 
 static int parse_nft_duration(const char *dur_str) {
     int total_sec = 0;
@@ -37,18 +39,20 @@ static int parse_nft_duration(const char *dur_str) {
 }
 
 int firewall_init(const Config *config) {
+    if (!config) return -1;
+
     int res = system("nft add table inet uban_filter 2>/dev/null");
+    (void)res;
+
+    res = system("nft add chain inet uban_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null");
     (void)res;
 
     for (int i = 0; i < config->jail_count; i++) {
         const Jail *j = &config->jails[i];
-        if (!j->enabled) continue;
+        if (!j || strlen(j->nft_set_name) == 0) continue;
 
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "nft add set inet uban_filter %s '{ type ipv4_addr; flags timeout; }' 2>/dev/null", j->nft_set_name);
-        res = system(cmd);
-
-        snprintf(cmd, sizeof(cmd), "nft add chain inet uban_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null");
         res = system(cmd);
 
         snprintf(cmd, sizeof(cmd), "nft add rule inet uban_filter input ip saddr @%s drop 2>/dev/null", j->nft_set_name);
@@ -126,8 +130,6 @@ int firewall_flush_all(const Config *config) {
     int flushed_jails = 0;
     for (int i = 0; i < config->jail_count; i++) {
         const Jail *j = &config->jails[i];
-        if (!j->enabled) continue;
-
         if (firewall_flush_jail(config, j->nft_set_name) == 0) flushed_jails++;
     }
     return flushed_jails;
@@ -205,122 +207,203 @@ void firewall_free_status_items(BanStatusItem *items) {
     if (items) free(items);
 }
 
-int firewall_save_state(const Config *config) {
-    char mkdir_cmd[MAX_PATH_LEN + 16];
-    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", config->db_dir);
-    int res = system(mkdir_cmd);
-    (void)res;
+/* ==============================================================================
+ * SNAPSHOT BACKUP & ROTATION (PRE-START DUMP, RETAIN TOP 5; 	MANUAL DUMP, RETAIN FOREVER)
+ * ============================================================================== */
 
-    char state_file[MAX_PATH_LEN + 16];
-    char tmp_state_file[MAX_PATH_LEN + 20];
-    snprintf(state_file, sizeof(state_file), "%s/bans.state", config->db_dir);
-    snprintf(tmp_state_file, sizeof(tmp_state_file), "%s/bans.state.tmp", config->db_dir);
+int firewall_dump_snapshot(const Config *config, char *out_snapshot_path, size_t path_size, bool manual) {
+    if (!config || strlen(config->db_dir) == 0) return -1;
 
-    // 1. Pre-load existing 4th column from disk as fallback
-    typedef struct {
-        char jail[MAX_NAME_LEN];
-        char ip[MAX_IP_LEN];
-        int orig_duration;
-    } ExistingStateItem;
+    char dump_file[MAX_PATH_LEN + 128];
+    char tmp_file[MAX_PATH_LEN + 136];
 
-    ExistingStateItem saved_items[512];
-    int saved_count = 0;
-
-    FILE *rfp = fopen(state_file, "r");
-    if (rfp) {
-        char line[MAX_LINE_LEN];
-        char r_jail[MAX_NAME_LEN], r_ip[MAX_IP_LEN];
-        int r_rem, r_orig;
-        while (fgets(line, sizeof(line), rfp) && saved_count < 512) {
-            if (sscanf(line, "%63s %45s %d %d", r_jail, r_ip, &r_rem, &r_orig) == 4) {
-                safe_strncpy(saved_items[saved_count].jail, r_jail, MAX_NAME_LEN);
-                safe_strncpy(saved_items[saved_count].ip, r_ip, MAX_IP_LEN);
-                saved_items[saved_count].orig_duration = r_orig;
-                saved_count++;
+    // 1. Determine destination path: custom name, generated manual name, or default auto name
+    if (out_snapshot_path && out_snapshot_path[0] != '\0') {
+        if (out_snapshot_path[0] == '~') {
+            const char *home = getenv("HOME");
+            if (!home || home[0] == '\0') {
+                log_msg("ERROR", "[SNAPSHOT] Unable to expand '~': HOME environment variable not set.");
+                return -1;
             }
+            // Skip the leading '~' and handle whether a slash follows (e.g. "~/file" vs "~")
+            const char *subpath = out_snapshot_path + 1;
+            if (*subpath == '/') subpath++;
+
+            snprintf(dump_file, sizeof(dump_file), "%s/%s", home, subpath);
+        } else if (out_snapshot_path[0] == '/' || strchr(out_snapshot_path, '/') != NULL) {
+            // Absolute (/var/...) or explicit relative (./dumps/..., sub/dir/...)
+            snprintf(dump_file, sizeof(dump_file), "%s", out_snapshot_path);
+        } else {
+            // Plain filename provided: place inside db_dir
+            snprintf(dump_file, sizeof(dump_file), "%s/%s", config->db_dir, out_snapshot_path);
         }
-        fclose(rfp);
+    } else {
+        time_t now = time(NULL);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+
+        char time_str[32];
+        strftime(time_str, sizeof(time_str), "%Y%m%d_%H%M%S", &tm_info);
+
+        const char *prefix = manual ? "nftables_manual" : "nftables_prestart";
+        snprintf(dump_file, sizeof(dump_file), "%s/%s_%s.dump", config->db_dir, prefix, time_str);
     }
 
-    FILE *fp = fopen(tmp_state_file, "w");
-    if (!fp) return -1;
+    snprintf(tmp_file, sizeof(tmp_file), "%s.tmp", dump_file);
 
-    for (int i = 0; i < config->jail_count; i++) {
-        const Jail *j = &config->jails[i];
-
-        BanStatusItem *items = NULL;
-        int count = 0;
-        firewall_get_banned_ips(j->nft_set_name, &items, &count);
-
-        for (int k = 0; k < count; k++) {
-            // PRIORITY 1: Check RAM for fresh/escalated ban duration
-            int orig_sec = get_active_ban_duration(j->nft_set_name, items[k].ip);
-
-            // PRIORITY 2: If not in RAM, fall back to preserved disk 4th column
-            if (orig_sec <= 0) {
-                for (int s = 0; s < saved_count; s++) {
-                    if (strcmp(saved_items[s].jail, j->name) == 0 && strcmp(saved_items[s].ip, items[k].ip) == 0) {
-                        orig_sec = saved_items[s].orig_duration;
-                        break;
-                    }
-                }
-            }
-
-            // PRIORITY 3: Fallback to nftables element / remaining TTL
-            if (orig_sec <= 0) {
-                orig_sec = (items[k].original_timeout_sec > 0) ? items[k].original_timeout_sec : items[k].expires_in_sec;
-            }
-
-            fprintf(fp, "%s %s %d %d\n", j->name, items[k].ip, items[k].expires_in_sec, orig_sec);
+    // 2. Resolve nftables binary location
+    const char *nft_bin = "/usr/sbin/nft";
+    if (access(nft_bin, X_OK) != 0) {
+        nft_bin = "/sbin/nft";
+        if (access(nft_bin, X_OK) != 0) {
+            nft_bin = "nft";
         }
-        firewall_free_status_items(items);
     }
 
-    fclose(fp);
-    rename(tmp_state_file, state_file);
+    char cmd[MAX_PATH_LEN + 256];
+    snprintf(cmd, sizeof(cmd), "%s -j list table inet uban_filter 2>/dev/null", nft_bin);
+
+    FILE *pipe = popen(cmd, "r");
+    if (!pipe) {
+        log_msg("ERROR", "[SNAPSHOT] Failed to invoke popen for command: %s", cmd);
+        return -1;
+    }
+
+    FILE *out = fopen(tmp_file, "w");
+    if (!out) {
+        pclose(pipe);
+        log_msg("ERROR", "[SNAPSHOT] Unable to open %s for writing.", tmp_file);
+        return -1;
+    }
+
+    char buf[4096];
+    size_t bytes_read;
+    long total_bytes = 0;
+
+    while ((bytes_read = fread(buf, 1, sizeof(buf), pipe)) > 0) {
+        fwrite(buf, 1, bytes_read, out);
+        total_bytes += bytes_read;
+    }
+
+    int pclose_rc = pclose(pipe);
+    fclose(out);
+
+    // 3. Validate output before committing
+    if (pclose_rc != 0 || total_bytes == 0) {
+        unlink(tmp_file);
+        log_msg("DEBUG", "[SNAPSHOT] Snapshot capture discarded: exit=%d, bytes=%ld", pclose_rc, total_bytes);
+        return -1;
+    }
+
+    if (rename(tmp_file, dump_file) != 0) {
+        unlink(tmp_file);
+        log_msg("ERROR", "[SNAPSHOT] Failed to commit snapshot rename: %s -> %s", tmp_file, dump_file);
+        return -1;
+    }
+
+    // 4. Return the resolved final path to caller if buffer is available
+    if (out_snapshot_path && path_size > 0) {
+        safe_strncpy(out_snapshot_path, dump_file, path_size);
+    }
+
+    log_msg("INFO", "[SNAPSHOT] Created firewall state snapshot at %s (%ld bytes).", dump_file, total_bytes);
     return 0;
 }
 
-int firewall_restore_state(const Config *config) {
-    char state_file[MAX_PATH_LEN + 32];
-    snprintf(state_file, sizeof(state_file), "%s/bans.state", config->db_dir);
+static int compare_dump_filenames_desc(const void *a, const void *b) {
+    const char *fa = *(const char **)a;
+    const char *fb = *(const char **)b;
+    return strcmp(fb, fa); // Descending order (newest timestamp first)
+}
 
-    FILE *fp = fopen(state_file, "r");
-    if (!fp) return 0;
+void firewall_prune_snapshots(const Config *config, int keep_count) {
+    DIR *dir = opendir(config->db_dir);
+    if (!dir) return;
 
-    char jail_name[MAX_NAME_LEN];
-    char ip[MAX_IP_LEN];
-    int expires_in_sec;
-    int orig_duration;
-    int restored_count = 0;
+    char **dumps = NULL;
+    int count = 0;
+    int capacity = 16;
+    dumps = (char **)malloc(capacity * sizeof(char *));
 
-    char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "%63s %45s %d %d", jail_name, ip, &expires_in_sec, &orig_duration) != 4) {
-            continue;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "nftables_prestart_", 18) == 0 &&
+            strstr(entry->d_name, ".dump") != NULL) {
+            if (count >= capacity) {
+                capacity *= 2;
+                dumps = (char **)realloc(dumps, capacity * sizeof(char *));
+            }
+            dumps[count++] = strdup(entry->d_name);
         }
+    }
+    closedir(dir);
 
-        for (int i = 0; i < config->jail_count; i++) {
-            const Jail *j = &config->jails[i];
-            if (strcmp(j->name, jail_name) == 0 && j->enabled) {
-                if (expires_in_sec > 0 || expires_in_sec == -1) {
-                    firewall_ban_ip(j->nft_set_name, ip, expires_in_sec);
+    if (count > keep_count) {
+        qsort(dumps, count, sizeof(char *), compare_dump_filenames_desc);
+        for (int i = keep_count; i < count; i++) {
+            char remove_path[MAX_PATH_LEN + 128];
+            snprintf(remove_path, sizeof(remove_path), "%s/%s", config->db_dir, dumps[i]);
+            unlink(remove_path);
+            log_msg("INFO", "[SNAPSHOT] Pruned old snapshot: %s", dumps[i]);
+        }
+    }
 
-                    uint64_t now_ms = get_current_time_ms();
-                    uint64_t expire_ms = (expires_in_sec > 0) ? (now_ms + ((uint64_t)expires_in_sec * 1000ULL)) : 0;
+    for (int i = 0; i < count; i++) free(dumps[i]);
+    free(dumps);
+}
 
-                    // Passes orig_duration so tracked->ban_duration holds true initial length
-                    register_active_ban(ip, j->name, j->nft_set_name, orig_duration, expire_ms);
-                    restored_count++;
-                }
+/* ==============================================================================
+ * DATABASE TO KERNEL SYNCHRONIZATION
+ * ============================================================================== */
+
+int firewall_sync_from_db(const Config *config) {
+    char db_path[MAX_PATH_LEN + 32];
+    snprintf(db_path, sizeof(db_path), "%s/uban.sqlite", config->db_dir);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        return -1;
+    }
+
+    const char *sql = 
+        "SELECT ip, jail, ban_end "
+        "FROM uban_records "
+        "WHERE ban_end = 0 OR ban_end > strftime('%s', 'now');";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+
+    int synced = 0;
+    time_t now = time(NULL);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *ip = (const char*)sqlite3_column_text(stmt, 0);
+        const char *jail_name = (const char*)sqlite3_column_text(stmt, 1);
+        long long ban_end = sqlite3_column_int64(stmt, 2);
+
+        const Jail *j = find_jail_by_name(config, jail_name);
+        if (!j) continue;
+
+        if (ban_end == 0) {
+            firewall_ban_ip(j->nft_set_name, ip, 0);
+            synced++;
+        } else {
+            long long remaining = ban_end - now;
+            if (remaining > 0) {
+                firewall_ban_ip(j->nft_set_name, ip, (int)remaining);
+                synced++;
             }
         }
     }
 
-    fclose(fp);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
 
-    if (restored_count > 0) {
-        log_msg("INFO", "[STATE] Restored %d active bans from state file.", restored_count);
+    if (synced > 0) {
+        log_msg("INFO", "[FIREWALL] Synced %d active bans from database into nftables.", synced);
     }
-    return restored_count;
+    return synced;
 }

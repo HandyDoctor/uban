@@ -19,8 +19,13 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
+#include <sqlite3.h>
 
-#define UBAN_VERSION "1.0.0"
+#define UBAN_VERSION "1.1.0"
+
+#define UBAN_RUN_DIR    "/run/uban"
+#define UBAN_STAT_FILE  "/run/uban/uban.stat"
+#define UBAN_CMD_FILE   "/run/uban/uban.cmd"
 
 #define MAX_IP_LEN 46
 #define MAX_LINE_LEN 8192
@@ -30,7 +35,7 @@
 #define MAX_JAILS 32
 #define MAX_APPS 16
 #define MAX_MATCH_PATTERNS 16
-#define MAX_TRACKED_IPS 50000
+#define MAX_TRACKED_IPS 10000
 #define TEN_YEARS_SEC 315360000
 #define MAX_IGNOREIP_LEN 256
 
@@ -50,15 +55,6 @@ static inline void safe_strncpy(char *dest, const char *src, size_t dest_size) {
     dest[i] = '\0';
 }
 
-/* Persistent offender historical record tracked in RAM */
-typedef struct OffenderRecord {
-    char ip[MAX_IP_LEN];
-    char jail_name[MAX_NAME_LEN];
-    int offense_count;
-    bool dirty;
-    struct OffenderRecord *next;
-} OffenderRecord;
-
 /* Event node tracking log occurrences */
 typedef struct EventNode {
     uint64_t timestamp_ms;
@@ -74,13 +70,16 @@ typedef struct IPEntry {
     struct IPEntry *next;
 } IPEntry;
 
-/* In-memory active ban node tracking */
 typedef struct ActiveBanNode {
     char ip[MAX_IP_LEN];
     char jail_name[MAX_NAME_LEN];
     char set_name[MAX_MATCH_LEN];
-    uint64_t expire_ms;         // Absolute epoch time in milliseconds when ban expires
+    uint64_t expire_ms;         // Absolute monotonic time in milliseconds when ban expires
+    long long ban_end;          // Epoch timestamp when ban expires (0 for permanent)
     int ban_duration;           // Stored original ban duration in seconds
+    int offense_count;          // Cumulative offense count maintained in RAM
+    bool is_max_ban;            // True if ban duration reached max_bantime or permanent
+    bool dirty;                 // Needs sync to SQLite at 60s tick or shutdown
     struct ActiveBanNode *next;
 } ActiveBanNode;
 
@@ -122,6 +121,10 @@ typedef struct {
     int default_banfactor;   // Global default escalation factor (e.g. 2)
     int default_max_bantime; // Global default max cap (e.g. 1 year in secs)
     char firewall_backend[MAX_NAME_LEN];
+    bool db_purge_enable;    // Enable periodic purge of inactive records
+    int db_purge_age;        // Max age in seconds for inactive records (default: 30d)
+    int db_purge_interval;   // Purge interval in seconds (default: 1d)
+    int max_track_ip;        // Ceiling of records held in RAM runway queue (default: 10000)
 } Config;
 
 /* Parsed log evaluation entry */
@@ -155,22 +158,34 @@ int firewall_flush_all(const Config *config);
 int firewall_get_banned_ips(const char *set_name, BanStatusItem **items, int *count);
 int firewall_get_ip_remaining_ttl(const char *set_name, const char *ip);
 void firewall_free_status_items(BanStatusItem *items);
-int firewall_save_state(const Config *config);
-int firewall_restore_state(const Config *config);
+int firewall_dump_snapshot(const Config *config, char *out_snapshot_path, size_t path_size, bool manual);
+void firewall_prune_snapshots(const Config *config, int keep_count);
+int firewall_sync_from_db(const Config *config);
 
-/* Evaluator & Offender RAM State management functions (src/evaluator.c) */
-void offender_db_init(const Config *config);
-void sync_db_files_on_startup(const Config *config);
-void offender_db_sync_to_disk(const Config *config);
-int offender_db_get_count(const char *jail_name, const char *ip);
-int offender_db_increment(const char *jail_name, const char *ip);
+/* SQLite Database & Evaluation functions (src/evaluator.c) */
+int uban_db_init(const Config *config);
+void uban_db_close(void);
+int uban_db_get_record(const char *jail_name, const char *ip, int *out_count, long long *out_ban_end, int *out_orig_ban_time);
+int uban_db_upsert_ban(const char *jail_name, const char *ip, long long ban_end, int orig_ban_time, int *out_new_count);
+int uban_db_mark_inactive(const char *jail_name, const char *ip);
+int uban_db_unban_ip_all(const char *ip);
+int uban_db_flush_jail(const char *jail_name, bool reset);
+int uban_db_flush_all(bool reset);
+void uban_db_purge_orphans(const Config *config);
+int uban_db_load_runway(const Config *config, int max_capacity);
+int uban_db_purge_history(const Config *config);
+int uban_db_get_counts(const Config *config, const char *target_app, const char *target_jail, int *out_active, int *out_total);
+int get_ram_runway_count(const Config *config, const char *target_app, const char *target_jail);
 void evaluate_entry(const LogEntry *entry, const Jail *jail, const char *matched_ip, Config *config);
 int calculate_incremental_ban(const Config *config, const Jail *jail, const char *ip, int offender_count);
 void register_active_ban(const char *ip, const char *jail_name, const char *set_name, int duration_sec, uint64_t expire_ms);
 void remove_active_ban_from_ram(const char *set_name, const char *ip);
 void clear_all_ip_trackers(void);
-void offender_db_reload(const Config *config);
-void offender_db_wipe_all(const Config *config);
+void prune_stale_ip_trackers(void);
+const Jail* find_jail_by_name(const Config *config, const char *jail_name);
+int uban_db_flush_ram_state(void);
+int uban_db_mark_expired(time_t now);
+int uban_db_get_runway_count(const Config *config, const char *target_app, const char *target_jail);
 
 /* Log parser function (src/log_parser.c) */
 bool parse_log_line(const char *line, const Jail *jail, char *extracted_ip);
@@ -179,5 +194,18 @@ bool parse_log_line(const char *line, const Jail *jail, char *extracted_ip);
 int tail_log(const Config *config);
 void clear_active_bans_ram(void);
 int get_active_ban_duration(const char *set_name, const char *ip);
+int get_active_bans_count(void);
+ActiveBanNode* find_active_ban(const char *jail_name, const char *ip);
+void register_active_ban_full(const char *ip, const char *jail_name, const char *set_name, 
+                              int duration_sec, uint64_t expire_ms, long long ban_end, 
+                              int offense_count, bool is_max_ban, bool dirty);
+void prune_active_bans_distant(time_t cutoff_epoch);
+ActiveBanNode* get_active_bans_head(void);
+void sync_ram_stats_file(const Config *config);
+
+/*  Commands for CLI functions (src/commands.c) */
+int init_command_listener(void);
+void process_queued_commands(const Config *config);
+int send_cli_command(const char *cmd_line);
 
 #endif /* UBAN_H */

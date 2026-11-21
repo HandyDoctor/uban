@@ -79,6 +79,12 @@ int load_config(const char *filepath, Config *config) {
     config->default_max_bantime = TEN_YEARS_SEC;
     config->poll_interval_ms = 10;
 
+    // Database History Purge and Runway Cache Defaults
+    config->db_purge_enable = true;
+    config->db_purge_age = 30 * 86400;       // Default: 30 days
+    config->db_purge_interval = 86400;       // Default: 1 day
+    config->max_track_ip = 10000;            // Default: 10,000 imminent expiration runway entries
+
     char line[MAX_LINE_LEN];
     char current_section[MAX_NAME_LEN] = "";
     Jail *current_jail = NULL;
@@ -114,7 +120,7 @@ int load_config(const char *filepath, Config *config) {
                         config->apps[app_idx].enabled = true; // Default true until 'enabled = false' is read
                     }
                 } else {
-                    // Child JAIL section (e.g. [nginx-444_666], [sshd-retry])
+                    // Child JAIL section (e.g. [nginx-444], [sshd-retry])
                     if (config->jail_count < MAX_JAILS) {
                         current_jail = &config->jails[config->jail_count++];
                         memset(current_jail, 0, sizeof(Jail));
@@ -175,6 +181,16 @@ int load_config(const char *filepath, Config *config) {
                 if (config->default_banfactor < 1) config->default_banfactor = 2;
             } else if (strcmp(key, "poll_interval_ms") == 0) {
                 config->poll_interval_ms = atoi(strip_quotes(val));
+            } else if (strcmp(key, "db_purge_enable") == 0) {
+                char *clean_val = strip_quotes(val);
+                config->db_purge_enable = (strcasecmp(clean_val, "true") == 0 || strcmp(clean_val, "1") == 0);
+            } else if (strcmp(key, "db_purge_age") == 0) {
+                config->db_purge_age = parse_duration(strip_quotes(val));
+            } else if (strcmp(key, "db_purge_interval") == 0) {
+                config->db_purge_interval = parse_duration(strip_quotes(val));
+            } else if (strcmp(key, "max_track_ip") == 0) {
+                config->max_track_ip = atoi(strip_quotes(val));
+                if (config->max_track_ip < 100) config->max_track_ip = 10000;
             }
         } else if (current_jail == NULL) {
             // Processing key-value for APP master block (e.g. [nginx])
@@ -187,7 +203,7 @@ int load_config(const char *filepath, Config *config) {
                 }
             }
         } else if (current_jail) {
-            // Processing key-value for CHILD JAIL (e.g. [nginx-400_403_405])
+            // Processing key-value for CHILD JAIL (e.g. [nginx-444])
             if (strcmp(key, "enabled") == 0) {
                 char *clean_val = strip_quotes(val);
                 current_jail->enabled = (strcasecmp(clean_val, "true") == 0 || strcmp(clean_val, "1") == 0);
