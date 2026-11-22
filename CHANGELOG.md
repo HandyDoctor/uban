@@ -9,6 +9,7 @@ All notable changes to **uban** are documented in this file.
   - Migrated active ban tracking, countdown timers, and repeat-offender strike history from v1.0 flat state files to an embedded, ACID-compliant WAL-mode SQLite database (`/var/lib/uban/uban.sqlite`).
   - **Zero External Dependencies:** SQLite (`sqlite3.c` / `sqlite3.h`) is bundled directly in the source tree and compiled statically into the `uban` binary—no external SQLite libraries, development headers, or background database services are required.
   - `sudo make install` automatically detects legacy v1.0 state files in `/var/lib/uban` and migrates them into `uban.sqlite` via `scripts/db_migration.sh`.
+- **Redundant Ban Suppression**: Short-circuits repeated firewall and database enforcement cycles when an already-banned IP/jail pair has reached `max_bantime` (or permanent ban), preventing CPU and I/O waste during sub-millisecond bot floods.
 - **On-Demand Manual Snapshots (`uban save_to_snapshot [path]`):**
   - Export live kernel `nftables` state at any time (online or offline).
   - Supports automatic timestamped naming (`nftables_manual_YYYYMMDD_HHMMSS.dump` in `/var/lib/uban/`), bare filenames, relative paths (`./`), absolute paths, and `~/` home directory expansion.
